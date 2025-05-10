@@ -2,319 +2,468 @@
 import base64
 from io import BytesIO
 import pandas as pd
-import numpy as np
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Image, Spacer
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Image, Spacer, PageBreak, Flowable
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm, inch
+from reportlab.graphics.shapes import Drawing, Rect, Line, String
+from reportlab.graphics.charts.piecharts import Pie
+from reportlab.graphics.charts.legends import Legend
 import matplotlib.pyplot as plt
-import datetime
+import numpy as np
+from collections import Counter
 
 # 2. Add this function somewhere after your imports and before your main code
-def create_download_report(patterns, type_profile, type_detail, Long, largeur_totale=None, 
-                           taux_perte=None, taux_efficacite=None, unique_patterns=None,
-                           epaisseur=None, is_surface_optim=False, piece_names=None):
-    """Creates a PDF report for download with optimization results"""
+class BarCutDiagram(Flowable):
+    """Flowable qui dessine un diagramme de découpe de barre"""
+    def __init__(self, pattern, lengths, labels, total_length, width=500, height=60):
+        Flowable.__init__(self)
+        self.pattern = pattern
+        self.lengths = lengths
+        self.labels = labels
+        self.total_length = total_length
+        self.width = width
+        self.height = height
+        self.colors = {
+            'cuts': ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', 
+                    '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf'],
+            'waste': '#707070',
+            'separator': '#000000'
+        }
+    
+    def draw(self):
+        """Dessine le diagramme"""
+        # Calcul de l'échelle
+        scale = self.width / self.total_length
+        
+        # Dessiner la barre
+        x_pos = 0
+        separator_width = 5
+        
+        # Pour chaque pièce dans le motif
+        for i, length in enumerate(self.pattern):
+            color_idx = i % len(self.colors['cuts'])
+            piece_width = scale * length
+            
+            # Dessiner le rectangle de la pièce
+            self.canv.setFillColor(colors.HexColor(self.colors['cuts'][color_idx]))
+            self.canv.rect(x_pos, 0, piece_width, self.height, fill=1)
+            
+            # Ajouter le texte si assez d'espace
+            if piece_width > 40:
+                self.canv.setFillColor(colors.white)
+                self.canv.setFont("Helvetica", 8)
+                label = self.labels.get(length, f"{length}mm")
+                text_width = self.canv.stringWidth(label, "Helvetica", 8)
+                if text_width < piece_width - 4:
+                    self.canv.drawCentredString(x_pos + piece_width/2, self.height/2 - 4, label)
+            
+            x_pos += piece_width
+            
+            # Ajouter un séparateur si ce n'est pas la dernière pièce
+            if i < len(self.pattern) - 1:
+                self.canv.setFillColor(colors.black)
+                self.canv.rect(x_pos, 0, scale * separator_width, self.height, fill=1)
+                x_pos += scale * separator_width
+        
+        # Dessiner la chute à la fin si elle existe
+        waste = self.total_length - sum(self.pattern) - (len(self.pattern) - 1) * separator_width
+        if waste > 0:
+            waste_width = scale * waste
+            self.canv.setFillColor(colors.HexColor(self.colors['waste']))
+            self.canv.rect(x_pos, 0, waste_width, self.height, fill=1)
+            
+            # Ajouter le texte de chute si assez d'espace
+            if waste_width > 40:
+                waste_text = f"Chute: {waste}mm"
+                text_width = self.canv.stringWidth(waste_text, "Helvetica", 8)
+                if text_width < waste_width - 4:
+                    self.canv.setFillColor(colors.white)
+                    self.canv.drawCentredString(x_pos + waste_width/2, self.height/2 - 4, waste_text)
+
+class PlateCutDiagram(Flowable):
+    """Flowable qui dessine un diagramme de découpe de tôle/platine"""
+    def __init__(self, dimensions, pattern, width=500, height=350):
+        Flowable.__init__(self)
+        self.plate_L = dimensions['plaque']['L']
+        self.plate_l = dimensions['plaque']['l']
+        self.piece_L = dimensions['piece']['L']
+        self.piece_l = dimensions['piece']['l']
+        self.h = pattern['h']
+        self.v = pattern['v']
+        self.width = width
+        self.height = height
+        self.scale = min(width / self.plate_L, height / self.plate_l)
+    
+    def draw(self):
+        """Dessine le diagramme de découpe de tôle"""
+        # Dessiner la plaque de base
+        self.canv.setFillColor(colors.HexColor('#f0f0f0'))
+        self.canv.setStrokeColor(colors.black)
+        self.canv.rect(0, 0, self.scale * self.plate_L, self.scale * self.plate_l, fill=1, stroke=1)
+        
+        # Dessiner les pièces découpées
+        self.canv.setFillColor(colors.HexColor('#1f77b4'))
+        
+        for row in range(self.v):
+            for col in range(self.h):
+                x0 = col * self.piece_L * self.scale
+                y0 = row * self.piece_l * self.scale
+                self.canv.rect(x0, y0, self.piece_L * self.scale, self.piece_l * self.scale, fill=1, stroke=1)
+
+def create_download_report(patterns, type_profile, type_detail, Long, 
+                           largeur_totale=None, taux_perte=None, taux_efficacite=None, 
+                           unique_patterns=None, epaisseur=None, is_surface_optim=False,
+                           longueurs=None, largeurs=None, quantites=None, noms=None):
+    """
+    Crée un rapport PDF téléchargeable avec les résultats d'optimisation
+    avec une meilleure esthétique et plus d'informations
+    """
     buffer = BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4)
+    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=20, leftMargin=20, 
+                           topMargin=20, bottomMargin=20)
     story = []
     
-    from reportlab.lib import colors
-    # Setup styles with blue theme
+    # Définition des styles avec couleur bleue pour les titres
     styles = getSampleStyleSheet()
+    
     title_style = ParagraphStyle(
         'Title',
         parent=styles['Heading1'],
-        textColor=colors.HexColor('#0000CC'),
-        spaceAfter=12,
-        fontSize=16
+        fontName='Helvetica-Bold',
+        fontSize=18,
+        textColor=colors.HexColor('#264CA8'),
+        spaceAfter=10,
+        alignment=1  # Centre
     )
+    
     subtitle_style = ParagraphStyle(
         'Subtitle',
         parent=styles['Heading2'],
-        textColor=colors.HexColor('#0055AA'),
+        fontName='Helvetica-Bold',
+        fontSize=14,
+        textColor=colors.HexColor('#0066CC'),
+        spaceBefore=15,
         spaceAfter=10,
-        fontSize=14
     )
-    normal_style = styles["Normal"]
     
-    # Add title and date
-    current_date = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-    if is_surface_optim and type_profile == "Tôle/Platine":
-        title_text = "Rapport d'optimisation de découpe de tôle"
-    else:
-        title_text = "Rapport d'optimisation de découpe de barres"
+    normal_style = ParagraphStyle(
+        'Normal',
+        parent=styles['Normal'],
+        fontSize=10,
+        spaceBefore=6,
+        spaceAfter=6
+    )
     
-    title = Paragraph(f"{title_text} - {current_date}", title_style)
+    # En-tête du document
+    title_text = f"Rapport d'optimisation de découpe - {type_profile} {type_detail}"
+    if type_profile == "Tôle/Platine" and epaisseur is not None:
+        title_text += f" - Épaisseur {epaisseur} mm"
+    title = Paragraph(title_text, title_style)
     story.append(title)
+    
+    # Informations sur le type d'optimisation
+    optim_type = "par surface" if is_surface_optim else "par longueur"
+    subtitle = Paragraph(f"Type d'optimisation : {optim_type.capitalize()}", subtitle_style)
+    story.append(subtitle)
     story.append(Spacer(1, 12))
     
-    # Material Information
-    if type_profile == "UPN":
-        material_info = f"Profilé: {type_profile} {type_detail} - Longueur: {Long} mm"
-    elif type_profile == "Cornière":
-        material_info = f"Profilé: {type_profile} {type_detail} - Longueur: {Long} mm"
-    elif type_profile == "Tôle/Platine":
-        material_info = f"Tôle: {epaisseur} mm - Dimensions: {Long} × {largeur_totale} mm"
+    # 1. Tableau des longueurs demandées
+    story.append(Paragraph("Longueurs demandées", subtitle_style))
+    
+    if type_profile == "Tôle/Platine":
+        # Cas des tôles - inclut largeur
+        headers = ['ID', 'Longueur (mm)', 'Largeur (mm)', 'Quantité']
+        data = [headers]
+        for i, (long, larg, quant) in enumerate(zip(longueurs, largeurs, quantites)):
+            name = noms[i] if noms and i < len(noms) else f"Pièce {i+1}"
+            data.append([name, f"{long}", f"{larg}", f"{quant}"])
     else:
-        material_info = f"Produit: {type_profile} {type_detail} - Longueur: {Long} mm"
+        # Cas des UPN et cornières - sans largeur
+        headers = ['ID', 'Longueur (mm)', 'Quantité']
+        data = [headers]
+        for i, (long, quant) in enumerate(zip(longueurs, quantites)):
+            name = noms[i] if noms and i < len(noms) else f"{type_profile} {type_detail} - {i+1}"
+            data.append([name, f"{long}", f"{quant}"])
     
-    product_info = Paragraph(material_info, subtitle_style)
-    story.append(product_info)
-    story.append(Spacer(1, 12))
+    lengths_table = Table(data, colWidths=[doc.width/len(headers) for _ in headers])
+    lengths_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#264CA8')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('ALIGN', (1, 1), (-1, -1), 'CENTER'),
+    ]))
+    story.append(lengths_table)
     
-    # -------------------------------
-    # Tableau des longueurs demandées avec noms
-    # -------------------------------
-    if not is_surface_optim and patterns:
-        lengths_data = [['Identifiant', 'Longueur (mm)', 'Quantité']]
-        for i, (length, quantity) in enumerate(zip(longueurs, quantites)):
-            name = piece_names[i] if piece_names and i < len(piece_names) else ""
-            identifier = f"{name} {type_detail}" if name else f"{type_detail}"
-            lengths_data.append([identifier, f"{length}", f"{quantity}"])
+    # 2. Statistiques de l'optimisation
+    story.append(Paragraph("Statistiques de l'optimisation", subtitle_style))
+    
+    # Tableaux des statistiques
+    if is_surface_optim and type_profile == "Tôle/Platine":
+        # Cas des tôles/platines - statistiques de surface uniquement
+        stats_data = [
+            ['Statistique', 'Valeur'],
+            ['Nombre de plaques utilisées', f"{len(patterns)}"],
+            ['Dimensions des plaques', f"{Long} × {largeur_totale} mm"],
+            ['Surface totale achetée', f"{len(patterns) * Long * largeur_totale / 1000000:.2f} m²"],
+            ['Taux de perte', f"{taux_perte:.2f}%"],
+            ['Taux d\'efficacité', f"{taux_efficacite:.2f}%"]
+        ]
         
-        lengths_table_title = Paragraph("Détail des longueurs demandées", subtitle_style)
-        story.append(lengths_table_title)
+        stats_table = Table(stats_data, colWidths=[doc.width/2 for _ in range(2)])
         
-        lengths_table = Table(lengths_data, colWidths=[doc.width/3-10, doc.width/3-10, doc.width/3-10])
-        lengths_table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (2, 0), colors.HexColor('#0055AA')),
-            ('TEXTCOLOR', (0, 0), (2, 0), colors.white),
-            ('ALIGN', (0, 0), (2, 0), 'CENTER'),
-            ('FONTNAME', (0, 0), (2, 0), 'Helvetica-Bold'),
-            ('BOTTOMPADDING', (0, 0), (2, 0), 6),
-            ('TOPPADDING', (0, 0), (2, 0), 6),
-            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
-            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            ('ALIGN', (1, 1), (2, -1), 'RIGHT')
-        ]))
-        story.append(lengths_table)
-        story.append(Spacer(1, 15))
+    elif is_surface_optim:
+        # Cas UPN/Cornière avec optimisation surface - double tableau
+        stats_length = [
+            ['Statistique (Longueur)', 'Valeur'],
+            ['Nombre de barres utilisées', f"{len(patterns)}"],
+            ['Longueur standard', f"{Long} mm"],
+            ['Longueur totale achetée', f"{len(patterns) * Long} mm"],
+            ['Taux de perte (longueur)', f"{taux_perte:.2f}%"],
+            ['Taux d\'efficacité (longueur)', f"{taux_efficacite:.2f}%"]
+        ]
+        
+        stats_surface = [
+            ['Statistique (Surface)', 'Valeur'],
+            ['Surface totale achetée', f"{len(patterns) * Long * calculer_section(type_profile, type_detail) / 1000000:.4f} m²"],
+            ['Surface utile', f"{sum((Long - p['waste_length']) * calculer_section(type_profile, type_detail) for p in patterns) / 1000000:.4f} m²"],
+            ['Surface de chute', f"{sum(p['waste_surface'] for p in patterns):.4f} m²"],
+            ['Taux de perte (surface)', f"{sum(p['waste_percentage'] for p in patterns) / len(patterns):.2f}%"],
+            ['Taux d\'efficacité (surface)', f"{100 - sum(p['waste_percentage'] for p in patterns) / len(patterns):.2f}%"]
+        ]
+        
+        # Créer une table à deux colonnes
+        stats_length_table = Table(stats_length, colWidths=[doc.width/4-5, doc.width/4-5])
+        stats_surface_table = Table(stats_surface, colWidths=[doc.width/4-5, doc.width/4-5])
+        
+        combined_data = []
+        for i in range(max(len(stats_length), len(stats_surface))):
+            row = []
+            if i < len(stats_length):
+                row.extend(stats_length[i])
+            else:
+                row.extend(['', ''])
+            row.append('')  # séparateur
+            if i < len(stats_surface):
+                row.extend(stats_surface[i])
+            else:
+                row.extend(['', ''])
+            combined_data.append(row)
+        
+        stats_table = Table(combined_data, colWidths=[doc.width/4-5, doc.width/4-5, 10, doc.width/4-5, doc.width/4-5])
+        
+    else:
+        # Cas standard - optimisation par longueur
+        stats_data = [
+            ['Statistique', 'Valeur'],
+            ['Nombre de barres utilisées', f"{len(patterns)}"],
+            ['Longueur standard', f"{Long} mm"],
+            ['Longueur totale achetée', f"{len(patterns) * Long} mm"],
+            ['Longueur totale utilisée', f"{sum(sum(p['cuts']) for p in patterns)} mm"],
+            ['Longueur totale de chute', f"{sum(p['waste'] for p in patterns)} mm"],
+            ['Taux de perte', f"{taux_perte:.2f}%"],
+            ['Taux d\'efficacité', f"{taux_efficacite:.2f}%"]
+        ]
+        
+        stats_table = Table(stats_data, colWidths=[doc.width/2 for _ in range(2)])
     
-    # -------------------------------
-    # Tableaux de statistiques côte à côte
-    # -------------------------------
-    col1, col2 = st.columns(2)
-    
-    # Statistiques de longueur
-    length_stats = [['Statistiques de longueur', 'Valeurs']]
-    length_stats.append(['Métrage net (mm)', f"{int(total_length_net)}"])
-    length_stats.append(['Métrage utilisé (mm)', f"{int(Long * len(patterns))}"])
-    length_stats.append(['Nombre de barres', f"{len(patterns)}"])
-    length_stats.append(['Total des chutes (mm)', f"{int(total_waste)}"])
-    length_stats.append(['Taux de chute', f"{taux_perte:.1f}%"])
-    length_stats.append(['Taux d\'efficacité', f"{taux_efficacite:.1f}%"])
-    
-    # Statistiques de surface
-    surface_stats = [['Statistiques de surface', 'Valeurs']]
-    total_surface = Long * largeur_totale if largeur_totale else Long * 100  # Approximation si pas de largeur
-    surface_utilisee = total_surface * (taux_efficacite/100)
-    surface_perdue = total_surface * (taux_perte/100)
-    
-    surface_stats.append(['Surface totale (mm²)', f"{int(total_surface)}"])
-    surface_stats.append(['Surface utilisée (mm²)', f"{int(surface_utilisee)}"])
-    surface_stats.append(['Surface perdue (mm²)', f"{int(surface_perdue)}"])
-    surface_stats.append(['Taux de perte surface', f"{taux_perte:.1f}%"])
-    surface_stats.append(['Taux d\'efficacité surface', f"{taux_efficacite:.1f}%"])
-
-    # Création des tableaux
-    stats_table_style = TableStyle([
-        ('BACKGROUND', (0, 0), (1, 0), colors.HexColor('#0055AA')),
-        ('TEXTCOLOR', (0, 0), (1, 0), colors.white),
-        ('ALIGN', (0, 0), (1, 0), 'CENTER'),
-        ('FONTNAME', (0, 0), (1, 0), 'Helvetica-Bold'),
+    # Style commun pour tous les tableaux de statistiques
+    stats_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#264CA8')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
         ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
         ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
         ('ALIGN', (1, 1), (1, -1), 'RIGHT')
-    ])
-
-    length_table = Table(length_stats, colWidths=[doc.width/2-10, doc.width/2-10])
-    length_table.setStyle(stats_table_style)
+    ]))
     
-    surface_table = Table(surface_stats, colWidths=[doc.width/2-10, doc.width/2-10])
-    surface_table.setStyle(stats_table_style)
-
-    # Ajout des tableaux côte à côte
-    story.append(Paragraph("Statistiques d'optimisation", subtitle_style))
-    story.append(Spacer(1, 10))
+    if is_surface_optim and type_profile != "Tôle/Platine":
+        # Style spécifique pour le tableau combiné
+        stats_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (1, 0), colors.HexColor('#264CA8')),
+            ('BACKGROUND', (3, 0), (4, 0), colors.HexColor('#264CA8')),
+            ('TEXTCOLOR', (0, 0), (1, 0), colors.white),
+            ('TEXTCOLOR', (3, 0), (4, 0), colors.white),
+            ('ALIGN', (0, 0), (1, 0), 'CENTER'),
+            ('ALIGN', (3, 0), (4, 0), 'CENTER'),
+            ('FONTNAME', (0, 0), (1, 0), 'Helvetica-Bold'),
+            ('FONTNAME', (3, 0), (4, 0), 'Helvetica-Bold'),
+            ('GRID', (0, 0), (1, -1), 0.5, colors.grey),
+            ('GRID', (3, 0), (4, -1), 0.5, colors.grey),
+            ('VALIGN', (0, 0), (4, -1), 'MIDDLE'),
+            ('SPAN', (2, 0), (2, -1)),  # fusionner la colonne du séparateur
+        ]))
     
-    # Création d'un tableau pour contenir les deux tableaux de stats
-    stats_container = Table([[length_table, surface_table]], colWidths=[doc.width/2-10, doc.width/2-10])
-    story.append(stats_container)
-    story.append(Spacer(1, 15))
-
-    # -------------------------------
-    # Graphiques en camembert côte à côte
-    # -------------------------------
-    # Création des deux graphiques
-    plt.figure(figsize=(10, 5))
-    
-    # Graphique de longueur
-    plt.subplot(1, 2, 1)
-    labels = ['Utilisé', 'Perte']
-    sizes = [taux_efficacite, taux_perte]
-    colors = ['#4CAF50', '#AAAAAA']
-    plt.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
-    plt.title('Répartition des longueurs')
-    plt.axis('equal')
-    
-    # Graphique de surface
-    plt.subplot(1, 2, 2)
-    plt.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
-    plt.title('Répartition des surfaces')
-    plt.axis('equal')
-    
-    # Sauvegarde des graphiques
-    chart_buffer = BytesIO()
-    plt.savefig(chart_buffer, format='png', bbox_inches='tight')
-    chart_buffer.seek(0)
-    plt.close()
-    
-    # Ajout des graphiques au PDF
-    chart_img = Image(chart_buffer, width=6*inch, height=3*inch)
-    story.append(chart_img)
+    story.append(stats_table)
     story.append(Spacer(1, 15))
     
-    # -------------------------------
-    # Graphique des motifs de découpe
-    # -------------------------------
-    patterns_title = Paragraph("Synthèse des motifs de découpe", title_style)
-    story.append(patterns_title)
-    story.append(Spacer(1, 10))
+    # 3. Graphiques de répartition (camembert)
+    story.append(Paragraph("Répartition de l'utilisation des matériaux", subtitle_style))
     
-    # Draw patterns graphically
-    if not is_surface_optim:
-        # Find unique patterns if not provided
-        if not unique_patterns:
-            unique_patterns = []
-            for i, pattern in enumerate(patterns):
-                unique_patterns.append({
-                    'pattern': pattern,
-                    'count': 1  # Just show each pattern once if unique_patterns not provided
-                })
+    # Création du/des graphique(s) avec matplotlib
+    if is_surface_optim and type_profile != "Tôle/Platine":
+        # Double camembert pour longueur et surface
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8, 4))
         
-        # For each unique pattern
-        for i, unique_pattern in enumerate(unique_patterns):
-            pattern = unique_pattern.get('pattern', patterns[i] if i < len(patterns) else patterns[0])
-            count = unique_pattern.get('count', 1)
-            
-            pattern_title = Paragraph(f"Motif de découpe #{i+1} (×{count})", subtitle_style)
-            story.append(pattern_title)
-            
-            # Create a visualization of the pattern
-            fig, ax = plt.subplots(figsize=(8, 1.5))
-            
-            # Extract segments from pattern based on format
-            segments = []
-            if 'segments' in pattern:
-                segments = sorted(pattern['segments'], key=lambda x: x.get('position', 0))
-            elif 'cuts' in pattern:
-                # Convert older 'cuts' format to segments
-                pos = 0
-                for j, cut in enumerate(pattern['cuts']):
-                    segment = {
-                        'length': cut,
-                        'position': pos,
-                        'type': type_detail
-                    }
-                    # Try to get name if it exists
-                    if 'names' in pattern and j < len(pattern['names']):
-                        segment['name'] = pattern['names'][j]
-                    segments.append(segment)
-                    pos += cut
-            
-            # Track position for drawing
-            current_pos = 0
-            segment_colors = ['#4CAF50', '#F44336', '#2196F3', '#FFC107', '#9C27B0']  # Green, Red, Blue, Yellow, Purple
-            
-            # Draw each segment
-            for j, segment in enumerate(segments):
-                width = segment['length']
-                color_index = j % len(segment_colors)
-                
-                # Get name for display
-                if 'name' in segment and segment['name']:
-                    display_name = f"[{segment['name']} {segment.get('type', type_detail)}] {width}mm"
+        # Camembert de longueur
+        total_longueur = len(patterns) * Long
+        total_waste_length = sum(p['waste_length'] for p in patterns)
+        lengths = [total_longueur - total_waste_length, total_waste_length]
+        ax1.pie(lengths, labels=['Utilisé', 'Perte'], autopct='%1.1f%%',
+                colors=['#2ca02c', '#707070'], startangle=90)
+        ax1.set_title("Répartition de la longueur", color='#264CA8')
+        ax1.axis('equal')
+        
+        # Camembert de surface
+        total_surface = len(patterns) * Long * calculer_section(type_profile, type_detail) / 1000
+        total_waste_surface = sum(p['waste_surface'] for p in patterns)
+        surfaces = [total_surface - total_waste_surface, total_waste_surface]
+        ax2.pie(surfaces, labels=['Utilisé', 'Perte'], autopct='%1.1f%%',
+                colors=['#2ca02c', '#707070'], startangle=90)
+        ax2.set_title("Répartition de la surface", color='#264CA8')
+        ax2.axis('equal')
+        
+    else:
+        # Simple camembert
+        fig, ax = plt.subplots(figsize=(6, 4))
+        
+        if is_surface_optim and type_profile == "Tôle/Platine":
+            # Camembert pour la surface des tôles
+            total_surface = len(patterns) * Long * largeur_totale
+            total_waste_surface = sum(p['waste_surface'] for p in patterns)
+            data = [total_surface - total_waste_surface, total_waste_surface]
+            ax.pie(data, labels=['Utilisé', 'Perte'], autopct='%1.1f%%',
+                   colors=['#2ca02c', '#707070'], startangle=90)
+            ax.set_title("Répartition de la surface", color='#264CA8')
+        else:
+            # Camembert pour la longueur standard
+            total_longueur_utilisee = sum(sum(p['cuts']) for p in patterns)
+            total_waste = sum(p['waste'] for p in patterns)
+            data = [total_longueur_utilisee, total_waste]
+            ax.pie(data, labels=['Utilisé', 'Perte'], autopct='%1.1f%%',
+                   colors=['#2ca02c', '#707070'], startangle=90)
+            ax.set_title("Répartition de la longueur", color='#264CA8')
+        
+        ax.axis('equal')
+    
+    # Sauvegarder le graphique et l'ajouter au PDF
+    img_buffer = BytesIO()
+    plt.savefig(img_buffer, format='png', bbox_inches='tight', dpi=150)
+    plt.close(fig)
+    img_buffer.seek(0)
+    img = Image(img_buffer, width=400, height=200)
+    story.append(img)
+    story.append(Spacer(1, 10))
+    
+    # 4. Synthèse des motifs de découpe
+    story.append(Paragraph("Synthèse des motifs de découpe", subtitle_style))
+    
+    # Création d'une table pour présenter les motifs
+    if unique_patterns:
+        # Trier les motifs par fréquence décroissante
+        unique_patterns.sort(key=lambda x: x['count'], reverse=True)
+        
+        # Créer un dictionnaire pour mapper les longueurs à leurs labels
+        label_map = {}
+        if longueurs and noms:
+            for i, (long, nom) in enumerate(zip(longueurs, noms)):
+                nom_long = f"{nom}" if nom else f"Pièce {i+1}"
+                if type_profile == "Tôle/Platine" and largeurs:
+                    label_map[long] = f"[{nom_long}] {long}×{largeurs[i]}mm"
                 else:
-                    display_name = f"[{segment.get('type', type_detail)}] {width}mm"
-                    
-                # Draw rectangle
-                rect = plt.Rectangle((current_pos, 0), width, 0.5, 
-                                    facecolor=segment_colors[color_index])
-                ax.add_patch(rect)
-                
-                # Add text in the middle of the segment
-                ax.text(current_pos + width/2, 0.25, display_name, 
-                        ha='center', va='center', color='white', fontweight='bold')
-                
-                current_pos += width
+                    label_map[long] = f"[{nom_long}] {long}mm"
+        
+        for i, pattern in enumerate(unique_patterns):
+            motif_title = Paragraph(f"Motif #{i+1} - Utilisé {pattern['count']} fois", subtitle_style)
+            story.append(motif_title)
             
-            # If there's waste at the end, draw it in grey
-            if isinstance(pattern, list):
-                # Assuming you want to access the first element of the list
-                waste = pattern[0].get('waste', pattern[0].get('waste_length', 0)) if pattern else 0
+            if type_profile == "Tôle/Platine" and 'dimensions' in pattern:
+                # Motif de découpe de tôle/platine
+                dimensions = pattern['dimensions']
+                pattern_config = pattern['pattern']
+                
+                plate_diagram = PlateCutDiagram(dimensions, pattern_config, width=400, height=250)
+                story.append(plate_diagram)
+                
+                # Informations sur le motif
+                info_data = [
+                    ['Dimensions pièce', f"{dimensions['piece']['L']}×{dimensions['piece']['l']} mm"],
+                    ['Disposition', f"{pattern_config['h']}×{pattern_config['v']} pièces"],
+                    ['Total', f"{pattern_config['h'] * pattern_config['v']} pièces par plaque"],
+                    ['Taux de perte', f"{pattern['waste_percentage']:.2f}%"]
+                ]
+                
+                info_table = Table(info_data, colWidths=[120, 150])
+                info_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#E3F2FD')),
+                    ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+                    ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                    ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                    ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                    ('LEFTPADDING', (0, 0), (-1, -1), 6),
+                    ('RIGHTPADDING', (0, 0), (-1, -1), 6)
+                ]))
+                story.append(info_table)
             else:
-                waste = pattern.get('waste', pattern.get('waste_length', 0))
-            if waste > 0:
-                waste_rect = plt.Rectangle((current_pos, 0), waste, 0.5, facecolor='grey')
-                ax.add_patch(waste_rect)
-                ax.text(current_pos + waste/2, 0.25, f"Chute: {waste} mm", 
-                        ha='center', va='center', color='white')
+                # Motif de découpe standard (UPN, Cornière)
+                if 'pattern' in pattern:
+                    cuts = pattern['pattern']
+                    waste = pattern.get('waste', 0)
+                    
+                    # Création du diagramme de découpe
+                    bar_diagram = BarCutDiagram(cuts, longueurs, label_map, Long, width=400, height=50)
+                    story.append(bar_diagram)
+                    
+                    # Tableau de détails des pièces
+                    pieces_count = Counter(cuts)
+                    detail_data = [['Pièce', 'Quantité']]
+                    
+                    for piece, count in pieces_count.items():
+                        detail_data.append([label_map.get(piece, f"{piece}mm"), f"{count}"]) 
+                    
+                    if waste > 0:
+                        detail_data.append(['Chute', f"{waste} mm"])
+                    
+                    detail_table = Table(detail_data, colWidths=[300, 100])
+                    detail_table.setStyle(TableStyle([
+                        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#264CA8')),
+                        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+                        ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
+                        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                        ('ALIGN', (1, 0), (1, -1), 'CENTER')
+                    ]))
+                    story.append(detail_table)
             
-            # Set axis limits and remove ticks
-            ax.set_xlim(0, Long)
-            ax.set_ylim(0, 0.5)
-            ax.set_xticks(np.arange(0, Long+1, 1000))
-            ax.set_yticks([])
-            ax.set_xlabel("Longueur (mm)")
-            
-            # Save the pattern visualization
-            pattern_buffer = BytesIO()
-            plt.savefig(pattern_buffer, format='png', bbox_inches='tight', dpi=100)
-            pattern_buffer.seek(0)
-            plt.close()
-            
-            # Add the pattern visualization to the PDF
-            pattern_img = Image(pattern_buffer, width=6*inch, height=1.2*inch)
-            story.append(pattern_img)
-            
-            # Add details panel on the right side (like in your image)
-            details_data = [['Sections']]
-            for segment in segments:
-                if 'name' in segment and segment['name']:
-                    section_name = f"{segment['name']} {segment.get('type', type_detail)}: {segment['length']} mm"
-                else:
-                    section_name = f"{segment.get('type', type_detail)}: {segment['length']} mm"
-                details_data.append([section_name])
-            
-            if waste > 0:
-                details_data.append([f"Chute: {waste} mm"])
-            
-            # Create the details table
-            details_table = Table(details_data, colWidths=[doc.width/2-10])
-            details_table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (0, 0), colors.HexColor('#0055AA')),
-                ('TEXTCOLOR', (0, 0), (0, 0), colors.white),
-                ('ALIGN', (0, 0), (0, 0), 'CENTER'),
-                ('FONTNAME', (0, 0), (0, 0), 'Helvetica-Bold'),
-                ('GRID', (0, 0), (0, -1), 0.5, colors.grey),
-                ('VALIGN', (0, 0), (0, -1), 'MIDDLE'),
-            ]))
-            
-            story.append(Spacer(1, 5))
-            story.append(Paragraph("Détails", subtitle_style))
-            story.append(details_table)
             story.append(Spacer(1, 15))
     
-    # Build PDF
+    # Construction du document final
     doc.build(story)
     pdf_data = buffer.getvalue()
     buffer.close()
     
-    # Encode to base64 for download
+    # Encodage en base64 pour le téléchargement
     b64_pdf = base64.b64encode(pdf_data).decode('utf-8')
     return b64_pdf
+
+def calculer_section(profile_type, type_detail):
+    """Fonction helper pour calculer la section d'un profilé"""
+    if profile_type == "UPN":
+        sections = {"UPN80": 11, "UPN100": 13.5, "UPN120": 17, "UPN140": 20.4}
+        return sections.get(type_detail, 11)
+    elif profile_type == "Cornière":
+        sections = {"70": 10.6, "60": 9.2, "45": 6.8, "40": 6.0}
+        return sections.get(type_detail, 9.2)
+    return 1  # Valeur par défaut
+
+
 
 import streamlit as st
 from backend_decoupe import optimiser_decoupe
@@ -424,28 +573,33 @@ n = st.number_input("Nombre de types de longueurs :", min_value=1, step=1, value
 longueurs = []
 largeurs = []
 quantites = []
-piece_names = []
+noms = []  # Nouvelle liste pour les noms/identifiants
 
 for i in range(n):
-    st.markdown(f"""
-        <div style="border: 2px solid #4CAF50; border-radius: 12px; padding: 15px; margin-bottom: 15px;">
-            <div style="background: linear-gradient(90deg, blue, #00B6F7); color: white; padding: 8px; border-radius: 8px 8px 0 0; font-weight: bold; font-size: 18px; text-align: center;">
-                Paramètres de la coupe {i+1}
-            </div>
-    """, unsafe_allow_html=True)
+    st.markdown(f"### Paramètres de la coupe {i+1}")
     
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        piece_name = st.text_input(f"Nom de la pièce {i+1}", key=f"name_{i}")
-    with col2:
-        longueur = st.number_input(f"Longueur {i+1} (mm)", min_value=1, value=1000, key=f"longueur_{i}")
-    with col3:
-        quantite = st.number_input(f"Quantité {i+1}", min_value=1, value=1, key=f"quantite_{i}")
+    # Disposition en colonnes pour tous les champs
+    if type_profile == "Tôle/Platine":
+        col1, col2, col3, col4 = st.columns([2, 2, 1, 2])
+        
+        l = col1.number_input(f"Longueur {i+1} (mm) :", min_value=100, step=100, key=f"long_{i}", value=1000+i*500)
+        w = col2.number_input(f"Largeur {i+1} (mm) :", min_value=100, step=100, key=f"larg_{i}", value=300+i*100)
+        q = col3.number_input(f"Quantité {i+1} :", min_value=1, step=1, key=f"quant_{i}", value=2)
+        nom = col4.text_input(f"Identifiant {i+1} :", key=f"nom_{i}", value=f"Pièce {i+1}")
+        
+        largeurs.append(w)
+    else:
+        col1, col2, col3 = st.columns([2, 1, 2])
+        
+        l = col1.number_input(f"Longueur {i+1} (mm) :", min_value=100, step=100, key=f"long_{i}", value=1000+i*500)
+        q = col2.number_input(f"Quantité {i+1} :", min_value=1, step=1, key=f"quant_{i}", value=2)
+        nom = col3.text_input(f"Identifiant {i+1} :", key=f"nom_{i}", value=f"Pièce {i+1}")
+        
+        largeurs.append(None)
     
-    st.markdown("</div>", unsafe_allow_html=True)
-    longueurs.append(longueur)
-    quantites.append(quantite)
-    piece_names.append(piece_name)  # Stockage des noms des pièces
+    longueurs.append(l)
+    quantites.append(q)
+    noms.append(nom)
 
 # Options de visualisation et d'algorithme
 st.markdown("""
@@ -767,12 +921,13 @@ if bouton_calcul:
         # Add this at the end of the "if bouton_calcul:" block, just before it ends:
 
         # Create download button for report
-        st.markdown("---")
         st.markdown("""
             <h3 style="color:blue; background-color:#E3F2FD; padding:8px; border-radius:8px;">
                 Télécharger la synthèse
             </h3>
         """, unsafe_allow_html=True)
+
+
 
         if optim_type == "Optimisation par longueur":
             pdf_base64 = create_download_report(
@@ -783,49 +938,55 @@ if bouton_calcul:
                 taux_perte=taux_perte,
                 taux_efficacite=taux_efficacite,
                 unique_patterns=unique_patterns,
-                piece_names=piece_names
+                longueurs=longueurs,  # Ajout des paramètres manquants
+                largeurs=largeurs,
+                quantites=quantites,
+                noms=noms
             )
-            
             download_filename = f"decoupe_{type_profile}_{type_detail}.pdf"
-        else:  # Optimisation par surface
+
+        elif optim_type == "Optimisation par surface":
             if type_profile == "Tôle/Platine":
                 pdf_base64 = create_download_report(
-                    patterns=surface_patterns,
+                    patterns=patterns,
                     type_profile=type_profile,
                     type_detail=type_detail,
                     Long=Long,
                     largeur_totale=largeur_totale,
-                    taux_perte=taux_perte_surface,
-                    taux_efficacite=taux_efficacite_surface,
+                    taux_perte=taux_perte,
+                    taux_efficacite=taux_efficacite,
                     unique_patterns=unique_patterns,
                     epaisseur=epaisseur,
                     is_surface_optim=True,
-                    piece_names=[format_piece_label(l, type_profile, type_detail, w) for l, w in zip(longueurs, largeurs)]
+                    longueurs=longueurs,  # Ajout des paramètres manquants
+                    largeurs=largeurs,
+                    quantites=quantites,
+                    noms=noms
                 )
-                
                 download_filename = f"decoupe_tole_{epaisseur}mm.pdf"
             else:
                 pdf_base64 = create_download_report(
-                    patterns=surface_patterns,
+                    patterns=patterns,
                     type_profile=type_profile,
                     type_detail=type_detail,
                     Long=Long,
-                    taux_perte=taux_perte_longueur,
-                    taux_efficacite=100-taux_perte_longueur,
+                    taux_perte=taux_perte,
+                    taux_efficacite=100 - taux_perte,
                     unique_patterns=unique_patterns,
-                    piece_names=[format_piece_label(l, type_profile, type_detail) for l in longueurs]
+                    longueurs=longueurs,  # Ajout des paramètres manquants
+                    largeurs=largeurs,
+                    quantites=quantites,
+                    noms=noms,
+                    is_surface_optim=True  # Important pour les UPN/Cornière en optimisation surface
                 )
-                
                 download_filename = f"decoupe_{type_profile}_{type_detail}.pdf"
-
-        # Create the download link
         href = f'<a href="data:application/pdf;base64,{pdf_base64}" download="{download_filename}" style="text-decoration:none;">'+\
             '<div style="background-color: #0066cc; color: white; padding: 12px 24px; border-radius: 8px; cursor: pointer; display: inline-block; text-align: center; width: 100%; font-weight: bold;">'+\
             '<i class="fas fa-download" style="margin-right: 8px;"></i>Télécharger le rapport PDF</div></a>'
 
         st.markdown(href, unsafe_allow_html=True)
 
-        st.info("Ce rapport contient un résumé des statistiques principales, le graphique de répartition des matériaux et les détails des motifs de découpe.")       
+        st.info("Ce rapport contient un résumé des statistiques principales, le graphique de répartition des matériaux et les détails des motifs de découpe.")
 
 # Dans la section de calcul des statistiques pour l'optimisation par surface:
     else:  # Optimisation par surface
